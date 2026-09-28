@@ -1,0 +1,849 @@
+#!/bin/sh
+
+_proxyctl_error_code=2
+
+proxyctl_error() {
+    # The code arrives as an argument rather than being read from the shared
+    # variable: the dispatch calls this *after* proxyctl_finish has already torn
+    # that variable down.
+    printf 'proxyctl: %s\n' "$2" >&2
+    return "$1"
+}
+
+proxyctl_help() {
+    cat <<'EOF'
+Usage:
+  . ./proxyctl set PROXY_URL [--all-proxy VALUE]
+  . ./proxyctl unset OPTION [OPTION ...]
+  . ./proxyctl status
+  ./proxyctl help | --help | -h
+
+Commands:
+  set PROXY_URL [--all-proxy VALUE]
+      Set HTTP_PROXY, HTTPS_PROXY, http_proxy, https_proxy, ALL_PROXY,
+      and all_proxy. PROXY_URL must immediately follow set.
+
+      --all-proxy VALUE sets only ALL_PROXY and all_proxy to VALUE. It may
+      be repeated; the last occurrence wins. Existing proxy values are
+      always replaced.
+
+  unset OPTION [OPTION ...]
+      --http-proxy  unset HTTP_PROXY and http_proxy
+      --https-proxy unset HTTPS_PROXY and https_proxy
+      --all-proxy   unset ALL_PROXY and all_proxy
+      -a            unset all six managed variables; takes priority over
+                    the selective options
+
+      At least one option is required.
+
+  status
+      Show all exported environment variables whose names contain "proxy",
+      case-insensitively. This is equivalent to: env | grep -i proxy
+
+  help, --help, -h
+      Show this help.
+
+  . ./proxyctl set --help
+  . ./proxyctl unset --help
+      Show command-specific help.
+
+Operational commands must be sourced. Help may be executed or sourced.
+
+Some shells (e.g. dash) do not pass arguments to '.'. In those, set them
+first: set -- set http://proxy.example.com:8080; . ./proxyctl
+
+Proxy URLs must use: http://[USER:PASSWORD@]HOST[:PORT] or
+https://[USER:PASSWORD@]HOST[:PORT]. The host may be a DNS hostname, an IPv4
+address, or a bracketed IPv6 address. A port is optional and must be 1-65535.
+Paths, query strings, and fragments are not allowed. Credential characters
+with URL syntax significance must be percent-encoded. Validation is syntactic
+only; no DNS lookup or network connection is attempted.
+
+NO_PROXY and no_proxy are never modified.
+EOF
+}
+
+proxyctl_help_set() {
+    cat <<'EOF'
+Usage: . ./proxyctl set PROXY_URL [--all-proxy VALUE]
+
+Sets HTTP_PROXY, HTTPS_PROXY, http_proxy, and https_proxy to PROXY_URL.
+Without --all-proxy, ALL_PROXY and all_proxy are also set to PROXY_URL.
+With --all-proxy VALUE, ALL_PROXY and all_proxy are set to VALUE. The option
+may be repeated and the last occurrence wins. PROXY_URL must immediately
+follow set, and no other arguments are accepted.
+
+Proxy URLs use http://[USER:PASSWORD@]HOST[:PORT] or
+https://[USER:PASSWORD@]HOST[:PORT]. The host may be a DNS hostname, an IPv4
+address, or a bracketed IPv6 address. A port is optional and must be 1-65535.
+Paths, query strings, and fragments are not allowed. Credential characters
+with URL syntax significance must be percent-encoded. Validation is syntactic
+only; no DNS lookup or network connection is attempted.
+EOF
+}
+
+proxyctl_help_unset() {
+    cat <<'EOF'
+Usage: . ./proxyctl unset OPTION [OPTION ...]
+
+Options:
+  --http-proxy  unset HTTP_PROXY and http_proxy
+  --https-proxy unset HTTPS_PROXY and https_proxy
+  --all-proxy   unset ALL_PROXY and all_proxy
+  -a            unset all six managed variables
+
+At least one option is required. Multiple selective options may be combined.
+If -a occurs anywhere, it takes priority and unsets all six variables.
+NO_PROXY and no_proxy are never modified.
+EOF
+}
+
+proxyctl_has_ipv4_host() {
+    # Exactly four dotted decimal octets, each 0-255. Pure `case` plus parameter
+    # expansion, so no subprocess is forked and there is no pipeline whose
+    # status a SIGPIPE could corrupt. The octet count is tallied rather than
+    # inferred, so "1.2.3" and "1.2.3.4.5" are rejected instead of accepted.
+    _proxyctl_octets=$1
+    _proxyctl_octet_count=0
+    _proxyctl_octet_ok=1
+
+    while [ -n "$_proxyctl_octets" ]; do
+        _proxyctl_octet=${_proxyctl_octets%%.*}
+
+        case "$_proxyctl_octets" in
+            *.*) _proxyctl_octets=${_proxyctl_octets#*.} ;;
+            *)   _proxyctl_octets= ;;
+        esac
+
+        _proxyctl_octet_count=$((_proxyctl_octet_count + 1))
+
+        case "$_proxyctl_octet" in
+            '' | *[!0-9]*)
+                _proxyctl_octet_ok=0
+                break
+                ;;
+        esac
+
+        # Leading zeros carry no meaning, and stripping them caps the digit
+        # count so the numeric comparison below cannot overflow.
+        _proxyctl_octet=${_proxyctl_octet#"${_proxyctl_octet%%[!0]*}"}
+        [ -n "$_proxyctl_octet" ] || _proxyctl_octet=0
+
+        if [ "${#_proxyctl_octet}" -gt 3 ] || [ "$_proxyctl_octet" -gt 255 ]; then
+            _proxyctl_octet_ok=0
+            break
+        fi
+    done
+
+    if [ "$_proxyctl_octet_count" -ne 4 ]; then
+        _proxyctl_octet_ok=0
+    fi
+
+    if [ "$_proxyctl_octet_ok" -eq 1 ]; then
+        unset _proxyctl_octets _proxyctl_octet _proxyctl_octet_count \
+            _proxyctl_octet_ok
+        return 0
+    fi
+
+    unset _proxyctl_octets _proxyctl_octet _proxyctl_octet_count \
+        _proxyctl_octet_ok
+    return 1
+}
+
+proxyctl_has_dns_host() {
+    # Walks the labels with parameter expansion: 1-63 characters drawn from
+    # alphanumerics, '-' and '_', never starting or ending with a hyphen, with
+    # no empty label. Underscores are allowed inside labels because they are
+    # common in Docker/Compose service names; a trailing dot stays rejected,
+    # as it always has been. The whole host is capped at 253 characters.
+    #
+    # A host whose *final* label is all digits is a malformed IPv4 literal
+    # rather than a name, so it is held to the four-octet rule instead. That
+    # is what rejects "1.2.3", "1.2.3.4.5" and "999.999.999.999".
+    _proxyctl_host_rest=$1
+    _proxyctl_host_last=${1##*.}
+    _proxyctl_host_label=$_proxyctl_host_last
+    _proxyctl_host_ok=1
+
+    if [ -z "$_proxyctl_host_rest" ] || [ "${#_proxyctl_host_rest}" -gt 253 ]; then
+        _proxyctl_host_ok=0
+    fi
+
+    while [ "$_proxyctl_host_ok" -eq 1 ] && [ -n "$_proxyctl_host_rest" ]; do
+        _proxyctl_host_label=${_proxyctl_host_rest%%.*}
+
+        case "$_proxyctl_host_rest" in
+            *.*) _proxyctl_host_rest=${_proxyctl_host_rest#*.} ;;
+            *)   _proxyctl_host_rest= ;;
+        esac
+
+        # "example.com." leaves an empty final label that the loop above never
+        # reaches, so the trailing dot is rejected before the walk starts.
+        case "$_proxyctl_host_label" in
+            '' | -* | *- | *[!A-Za-z0-9_-]*)
+                _proxyctl_host_ok=0
+                ;;
+        esac
+
+        if [ "${#_proxyctl_host_label}" -gt 63 ]; then
+            _proxyctl_host_ok=0
+        fi
+    done
+
+    unset _proxyctl_host_rest _proxyctl_host_label
+
+    if [ "$_proxyctl_host_ok" -eq 1 ]; then
+        case "$_proxyctl_host_last" in
+            *[!0-9]*) ;;
+            *)
+                if ! proxyctl_has_ipv4_host "$1"; then
+                    _proxyctl_host_ok=0
+                fi
+                ;;
+        esac
+    fi
+
+    if [ "$_proxyctl_host_ok" -eq 1 ]; then
+        unset _proxyctl_host_last _proxyctl_host_ok
+        return 0
+    fi
+
+    unset _proxyctl_host_last _proxyctl_host_ok
+    return 1
+}
+
+proxyctl_has_ipv6_host() {
+    # Real shape, not just a character set: at least two colons, no ":::" and
+    # at most one "::", no single leading or trailing colon, every group 1-4 hex
+    # digits, and a final group allowed to be a dotted IPv4 address that counts
+    # as two groups. Eight groups in the full form, seven or fewer with a "::".
+    _proxyctl_v6=$1
+    _proxyctl_v6_ok=1
+    _proxyctl_v6_groups=0
+    _proxyctl_v6_gap=0
+
+    case "$_proxyctl_v6" in
+        *[!0-9A-Fa-f:.]*) _proxyctl_v6_ok=0 ;;
+    esac
+
+    if [ "$_proxyctl_v6_ok" -eq 1 ]; then
+        # A leading or trailing colon is only legal as part of "::", so "::1"
+        # stands but ":1:2:3:4:5:6:7:8" and "1:2:3:4:5:6:7:8:" do not.
+        case "$_proxyctl_v6" in
+            :*) case "$_proxyctl_v6" in ::*) ;; *) _proxyctl_v6_ok=0 ;; esac ;;
+        esac
+        case "$_proxyctl_v6" in
+            *:) case "$_proxyctl_v6" in *::) ;; *) _proxyctl_v6_ok=0 ;; esac ;;
+        esac
+    fi
+
+    if [ "$_proxyctl_v6_ok" -eq 1 ]; then
+        case "$_proxyctl_v6" in
+            *::*)
+                # Two "::" would be ambiguous; three colons in a row is the
+                # degenerate form of the same mistake.
+                case "${_proxyctl_v6#*::}" in
+                    *::* | :* | *:) _proxyctl_v6_ok=0 ;;
+                    *) _proxyctl_v6_gap=1 ;;
+                esac
+                ;;
+        esac
+    fi
+
+    _proxyctl_v6_rest=$_proxyctl_v6
+
+    while [ "$_proxyctl_v6_ok" -eq 1 ] && [ -n "$_proxyctl_v6_rest" ]; do
+        _proxyctl_v6_group=${_proxyctl_v6_rest%%:*}
+
+        case "$_proxyctl_v6_rest" in
+            *:*) _proxyctl_v6_rest=${_proxyctl_v6_rest#*:} ;;
+            *)   _proxyctl_v6_rest= ;;
+        esac
+
+        # An empty group is the "::" shorthand; it stands for no explicit
+        # groups, so it must not be counted.
+        if [ -n "$_proxyctl_v6_group" ]; then
+            case "$_proxyctl_v6_group" in
+                *.*)
+                    # Only the final group may be a dotted IPv4 address.
+                    if [ -n "$_proxyctl_v6_rest" ] ||
+                        ! proxyctl_has_ipv4_host "$_proxyctl_v6_group"; then
+                        _proxyctl_v6_ok=0
+                    else
+                        _proxyctl_v6_groups=$((_proxyctl_v6_groups + 2))
+                    fi
+                    ;;
+                *[!0-9A-Fa-f]*)
+                    _proxyctl_v6_ok=0
+                    ;;
+                *)
+                    if [ "${#_proxyctl_v6_group}" -gt 4 ]; then
+                        _proxyctl_v6_ok=0
+                    else
+                        _proxyctl_v6_groups=$((_proxyctl_v6_groups + 1))
+                    fi
+                    ;;
+            esac
+        fi
+    done
+
+    if [ "$_proxyctl_v6_ok" -eq 1 ]; then
+        if [ "$_proxyctl_v6_gap" -eq 1 ]; then
+            # "::" stands in for at least one group, so up to seven explicit
+            # groups are fine.
+            if [ "$_proxyctl_v6_groups" -gt 7 ]; then
+                _proxyctl_v6_ok=0
+            fi
+        elif [ "$_proxyctl_v6_groups" -ne 8 ]; then
+            # No shorthand means all eight groups have to be spelled out.
+            _proxyctl_v6_ok=0
+        fi
+    fi
+
+    if [ "$_proxyctl_v6_ok" -eq 1 ]; then
+        unset _proxyctl_v6 _proxyctl_v6_ok _proxyctl_v6_groups \
+            _proxyctl_v6_gap _proxyctl_v6_rest _proxyctl_v6_group
+        return 0
+    fi
+
+    unset _proxyctl_v6 _proxyctl_v6_ok _proxyctl_v6_groups _proxyctl_v6_gap \
+        _proxyctl_v6_rest _proxyctl_v6_group
+    return 1
+}
+
+proxyctl_validate_credentials() {
+    # Credentials are runs of ordinary characters plus %XX escapes. The string
+    # is consumed one token at a time: whitespace and a percent sign that does
+    # not introduce two hex digits are rejected. Scanning in the shell keeps
+    # the check synchronous, so its result is never confused by SIGPIPE.
+    _proxyctl_creds=$1
+
+    while [ -n "$_proxyctl_creds" ]; do
+        case "$_proxyctl_creds" in
+            *[[:space:]]*)
+                unset _proxyctl_creds
+                return 1
+                ;;
+            %[0-9A-Fa-f][0-9A-Fa-f]*)
+                _proxyctl_creds=${_proxyctl_creds#???}
+                ;;
+            %*)
+                unset _proxyctl_creds
+                return 1
+                ;;
+            *)
+                _proxyctl_creds=${_proxyctl_creds#?}
+                ;;
+        esac
+    done
+
+    unset _proxyctl_creds
+    return 0
+}
+
+proxyctl_has_valid_port() {
+    proxyctl_port=$1
+
+    if [ -z "$proxyctl_port" ]; then
+        unset proxyctl_port
+        return 1
+    fi
+
+    case "$proxyctl_port" in
+        *[!0-9]*)
+            unset proxyctl_port
+            return 1
+            ;;
+    esac
+
+    # Leading zeros carry no meaning for a port, so "00" and "000" are port 0
+    # and must be rejected. Stripping them also caps the digit count, which is
+    # what keeps the comparison below from overflowing on absurd input.
+    proxyctl_port=${proxyctl_port#"${proxyctl_port%%[!0]*}"}
+
+    if [ -z "$proxyctl_port" ] || [ "${#proxyctl_port}" -gt 5 ]; then
+        unset proxyctl_port
+        return 1
+    fi
+
+    if [ "$proxyctl_port" -gt 65535 ]; then
+        unset proxyctl_port
+        return 1
+    fi
+
+    unset proxyctl_port
+    return 0
+}
+
+proxyctl_fail_url() {
+    # Called from inside proxyctl_validate_url, which then returns 1 itself.
+    # A helper cannot return on its caller's behalf, so the caller must branch
+    # on the result rather than using `cmd || fail`.
+    unset proxyctl_url proxyctl_remainder proxyctl_credentials proxyctl_host_port \
+        proxyctl_host proxyctl_port proxyctl_rest _proxyctl_creds
+    return 1
+}
+
+proxyctl_validate_url() {
+    proxyctl_url=$1
+    proxyctl_remainder=
+    proxyctl_credentials=
+    proxyctl_host_port=
+    proxyctl_host=
+    proxyctl_port=
+    proxyctl_rest=
+
+    case "$proxyctl_url" in
+        http://*)
+            proxyctl_remainder=${proxyctl_url#http://}
+            ;;
+        https://*)
+            proxyctl_remainder=${proxyctl_url#https://}
+            ;;
+        *)
+            proxyctl_fail_url
+            return 1
+            ;;
+    esac
+
+    # Paths, query strings and fragments are not part of a proxy URL.
+    case "$proxyctl_remainder" in
+        */*|*'?'*|*'#'*)
+            proxyctl_fail_url
+            return 1
+            ;;
+    esac
+
+    case "$proxyctl_remainder" in
+        *@*)
+            proxyctl_credentials=${proxyctl_remainder%@*}
+            proxyctl_host_port=${proxyctl_remainder#*@}
+
+            case "$proxyctl_credentials" in
+                ''|*@*)
+                    proxyctl_fail_url
+                    return 1
+                    ;;
+            esac
+
+            if ! proxyctl_validate_credentials "$proxyctl_credentials"; then
+                proxyctl_fail_url
+                return 1
+            fi
+            ;;
+        *)
+            proxyctl_host_port=$proxyctl_remainder
+            ;;
+    esac
+
+    if [ -z "$proxyctl_host_port" ]; then
+        proxyctl_fail_url
+        return 1
+    fi
+
+    case "$proxyctl_host_port" in
+        \[*)
+            # A bracketed host is closed by the FIRST "]", and nothing but a
+            # port may follow it. Splitting the text at that bracket is what
+            # keeps "[::1]]:80" and "[::1]:8080]garbage" from being silently
+            # truncated into something that looks valid.
+            case "$proxyctl_host_port" in
+                *\]*) ;;
+                *)
+                    proxyctl_fail_url
+                    return 1
+                    ;;
+            esac
+
+            proxyctl_host=${proxyctl_host_port#\[}
+            proxyctl_host=${proxyctl_host%%\]*}
+            proxyctl_rest=${proxyctl_host_port#*\]}
+
+            case "$proxyctl_rest" in
+                '')
+                    : # no port was given
+                    ;;
+                :*)
+                    proxyctl_port=${proxyctl_rest#:}
+
+                    if ! proxyctl_has_valid_port "$proxyctl_port"; then
+                        proxyctl_fail_url
+                        return 1
+                    fi
+                    ;;
+                *)
+                    proxyctl_fail_url
+                    return 1
+                    ;;
+            esac
+
+            if [ -z "$proxyctl_host" ] ||
+                ! proxyctl_has_ipv6_host "$proxyctl_host"; then
+                proxyctl_fail_url
+                return 1
+            fi
+            ;;
+        *:*)
+            proxyctl_host=${proxyctl_host_port%%:*}
+            proxyctl_port=${proxyctl_host_port#*:}
+
+            if [ -z "$proxyctl_host" ]; then
+                proxyctl_fail_url
+                return 1
+            fi
+
+            if ! proxyctl_has_dns_host "$proxyctl_host"; then
+                proxyctl_fail_url
+                return 1
+            fi
+
+            if ! proxyctl_has_valid_port "$proxyctl_port"; then
+                proxyctl_fail_url
+                return 1
+            fi
+            ;;
+        *)
+            proxyctl_host=$proxyctl_host_port
+
+            if [ -z "$proxyctl_host" ] || ! proxyctl_has_dns_host "$proxyctl_host"; then
+                proxyctl_fail_url
+                return 1
+            fi
+            ;;
+    esac
+
+    unset proxyctl_url proxyctl_remainder proxyctl_credentials proxyctl_host_port \
+        proxyctl_host proxyctl_port proxyctl_rest
+    return 0
+}
+
+proxyctl_is_sourced() {
+    [ "$_proxyctl_is_sourced" -eq 1 ]
+}
+
+proxyctl_require_sourced() {
+    if proxyctl_is_sourced; then
+        return 0
+    fi
+
+    proxyctl_error "$_proxyctl_error_code" 'operation requires the script to be sourced'
+    return "$_proxyctl_error_code"
+}
+
+proxyctl_set() {
+    proxyctl_primary=
+    proxyctl_all_value=
+    proxyctl_have_all=0
+
+    if [ "$#" -eq 1 ] && [ "$1" = '--help' ]; then
+        proxyctl_help_set
+        unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+        return 0
+    fi
+
+    if [ "$#" -lt 1 ]; then
+        proxyctl_error "$_proxyctl_error_code" 'missing proxy URL'
+        unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+        return "$_proxyctl_error_code"
+    fi
+
+    case "$1" in
+        http://*|https://*)
+            proxyctl_primary=$1
+            shift
+            ;;
+        *)
+            proxyctl_error "$_proxyctl_error_code" "invalid proxy URL: $1"
+            unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+            return "$_proxyctl_error_code"
+            ;;
+    esac
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --all-proxy)
+                if [ "$#" -lt 2 ]; then
+                    proxyctl_error "$_proxyctl_error_code" 'missing value for --all-proxy'
+                    unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+                    return "$_proxyctl_error_code"
+                fi
+                proxyctl_all_value=$2
+                proxyctl_have_all=1
+
+                # Every occurrence is validated as it is parsed, not just the
+                # one that survives: an earlier bad value must not be hidden by
+                # a later good one. Safe here because no managed variable has
+                # been touched yet, so the environment is still untouched.
+                if ! proxyctl_validate_url "$2"; then
+                    proxyctl_error "$_proxyctl_error_code" "invalid --all-proxy URL: $2"
+                    unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+                    return "$_proxyctl_error_code"
+                fi
+
+                shift 2
+                ;;
+            *)
+                proxyctl_error "$_proxyctl_error_code" "unexpected argument: $1"
+                unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+                return "$_proxyctl_error_code"
+                ;;
+        esac
+    done
+
+    # The primary URL stands in only when --all-proxy was never mentioned, so
+    # an explicitly empty value is rejected as an invalid URL rather than
+    # quietly replaced.
+    [ "$proxyctl_have_all" -eq 1 ] || proxyctl_all_value=$proxyctl_primary
+
+    if ! proxyctl_validate_url "$proxyctl_primary"; then
+        proxyctl_error "$_proxyctl_error_code" "invalid proxy URL: $proxyctl_primary"
+        unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+        return "$_proxyctl_error_code"
+    fi
+
+    if ! proxyctl_validate_url "$proxyctl_all_value"; then
+        proxyctl_error "$_proxyctl_error_code" "invalid --all-proxy URL: $proxyctl_all_value"
+        unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+        return "$_proxyctl_error_code"
+    fi
+
+    HTTP_PROXY=$proxyctl_primary
+    HTTPS_PROXY=$proxyctl_primary
+    http_proxy=$proxyctl_primary
+    https_proxy=$proxyctl_primary
+    ALL_PROXY=$proxyctl_all_value
+    all_proxy=$proxyctl_all_value
+    export HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+    unset proxyctl_primary proxyctl_all_value proxyctl_have_all
+}
+
+proxyctl_unset() {
+    proxyctl_http_selected=0
+    proxyctl_https_selected=0
+    proxyctl_all_selected=0
+    proxyctl_saw_option=0
+    proxyctl_argument=
+
+    if [ "$#" -eq 1 ] && [ "$1" = '--help' ]; then
+        proxyctl_help_unset
+        unset proxyctl_http_selected proxyctl_https_selected proxyctl_all_selected \
+            proxyctl_saw_option proxyctl_argument
+        return 0
+    fi
+
+    if [ "$#" -eq 0 ]; then
+        proxyctl_error "$_proxyctl_error_code" 'unset requires at least one option'
+        unset proxyctl_http_selected proxyctl_https_selected proxyctl_all_selected \
+            proxyctl_saw_option proxyctl_argument
+        return "$_proxyctl_error_code"
+    fi
+
+    for proxyctl_argument in "$@"; do
+        case "$proxyctl_argument" in
+            --http-proxy)
+                proxyctl_saw_option=1
+                proxyctl_http_selected=1
+                ;;
+            --https-proxy)
+                proxyctl_saw_option=1
+                proxyctl_https_selected=1
+                ;;
+            --all-proxy)
+                proxyctl_saw_option=1
+                proxyctl_all_selected=1
+                ;;
+            -a)
+                proxyctl_saw_option=1
+                proxyctl_http_selected=1
+                proxyctl_https_selected=1
+                proxyctl_all_selected=1
+                ;;
+            *)
+                proxyctl_error "$_proxyctl_error_code" "unknown unset option: $proxyctl_argument"
+                unset proxyctl_http_selected proxyctl_https_selected proxyctl_all_selected \
+                    proxyctl_saw_option proxyctl_argument
+                return "$_proxyctl_error_code"
+                ;;
+        esac
+    done
+
+    if [ "$proxyctl_saw_option" -eq 0 ]; then
+        proxyctl_error "$_proxyctl_error_code" 'unset requires at least one option'
+        unset proxyctl_http_selected proxyctl_https_selected proxyctl_all_selected \
+            proxyctl_saw_option proxyctl_argument
+        return "$_proxyctl_error_code"
+    fi
+
+    if [ "$proxyctl_http_selected" -eq 1 ]; then
+        unset HTTP_PROXY http_proxy
+    fi
+
+    if [ "$proxyctl_https_selected" -eq 1 ]; then
+        unset HTTPS_PROXY https_proxy
+    fi
+
+    if [ "$proxyctl_all_selected" -eq 1 ]; then
+        unset ALL_PROXY all_proxy
+    fi
+
+    unset proxyctl_http_selected proxyctl_https_selected proxyctl_all_selected \
+        proxyctl_saw_option proxyctl_argument
+}
+
+proxyctl_status() {
+    proxyctl_status_output=$(env | grep -i proxy)
+    proxyctl_status_result=$?
+
+    if [ "$proxyctl_status_result" -eq 0 ]; then
+        printf '%s\n' "$proxyctl_status_output"
+        unset proxyctl_status_output proxyctl_status_result
+        return 0
+    fi
+
+    printf 'No proxy environment variables set.\n'
+    unset proxyctl_status_output proxyctl_status_result
+}
+
+proxyctl_finish() {
+    # Removes the script's namespace from the caller's shell. It is cleanup
+    # only: it neither returns nor exits, because deciding between the two
+    # cannot be done from inside a function. A `return` here would always
+    # succeed, even when the file is being executed, and the process would
+    # carry on into functions that were just removed. The dispatcher leaves
+    # with `return N 2>/dev/null || exit N` at the top level of the file
+    # instead, where the two can be told apart.
+    #
+    # The status is deliberately not a parameter any more: every caller spells
+    # its own status out as a literal, so nothing has to survive the teardown.
+
+    # zsh warns ("no such hash table element") when unsetting a function that
+    # was never defined, so each name is tested first.
+    for _proxyctl_fn in proxyctl_help proxyctl_help_set proxyctl_help_unset \
+        proxyctl_error proxyctl_has_ipv4_host proxyctl_has_dns_host \
+        proxyctl_has_ipv6_host proxyctl_validate_credentials \
+        proxyctl_has_valid_port proxyctl_fail_url proxyctl_validate_url \
+        proxyctl_is_sourced proxyctl_require_sourced \
+        proxyctl_set proxyctl_unset proxyctl_status proxyctl_finish; do
+        if command -v "$_proxyctl_fn" >/dev/null 2>&1; then
+            unset -f "$_proxyctl_fn"
+        fi
+    done
+
+    unset _proxyctl_fn _proxyctl_error_code _proxyctl_is_sourced \
+        proxyctl_command
+}
+
+# Sourced versus executed. Getting this wrong is what previously made the
+# script kill whatever shell sourced it, because a false "executed" verdict
+# sent the error path through `exit`. So each shell is asked a question it can
+# actually answer, and the answer only ever errs towards "sourced": a mistake
+# here costs a refused command, never a dead session.
+if [ -n "${ZSH_EVAL_CONTEXT-}" ]; then
+    # zsh reports this directly ("toplevel:file" when a file is sourced,
+    # "toplevel" when it is run) and never exports the variable, so it cannot
+    # be inherited and misread.
+    case "${ZSH_EVAL_CONTEXT-}" in
+        *:file) _proxyctl_is_sourced=1 ;;
+        *)      _proxyctl_is_sourced=0 ;;
+    esac
+elif [ -n "${BASH_VERSION-}" ]; then
+    # bash names the file it is reading in BASH_SOURCE and the script it was
+    # invoked as in $0. Those differ exactly when a file is being sourced,
+    # whether from a terminal, from another script, or under a custom $0.
+    if [ "${BASH_SOURCE-}" != "$0" ]; then
+        _proxyctl_is_sourced=1
+    else
+        _proxyctl_is_sourced=0
+    fi
+else
+    # dash, ksh, ash, busybox and friends expose no such variable, and their
+    # $0 holds the *caller's* name while a file is sourced -- which is no help,
+    # since it is the same name the shell itself was invoked with. There is
+    # nothing left to ask but the file itself: if $0 is a readable copy of
+    # this script, it was executed. Anything else is treated as sourced, and
+    # the marker line at the end of the file is the only thing that can make
+    # this file match itself.
+    _proxyctl_is_sourced=1
+
+    if [ -f "$0" ] && grep -q '^# proxyctl-marker$' "$0" 2>/dev/null; then
+        _proxyctl_is_sourced=0
+    fi
+fi
+
+proxyctl_command=${1-}
+
+# Every arm leaves the file the same way: clean up, then `return N 2>/dev/null
+# || exit N` with N spelled out as a literal. A `return` at the top level of a
+# sourced file hands control back to the caller; run as a script it fails, and
+# the `||` branch exits with the same status. That is the only way to tell the
+# two apart from inside one file -- a `return` inside a function would always
+# succeed, even when the file is being executed. Every arm ends this way so
+# nothing falls through into functions proxyctl_finish has just removed.
+case "$proxyctl_command" in
+    set)
+        shift
+        if ! proxyctl_require_sourced; then
+            proxyctl_finish
+            return 2 2>/dev/null || exit 2
+        fi
+        if proxyctl_set "$@"; then
+            proxyctl_finish
+            return 0 2>/dev/null || exit 0
+        fi
+        proxyctl_finish
+        return 2 2>/dev/null || exit 2
+        ;;
+    unset)
+        shift
+        if ! proxyctl_require_sourced; then
+            proxyctl_finish
+            return 2 2>/dev/null || exit 2
+        fi
+        if proxyctl_unset "$@"; then
+            proxyctl_finish
+            return 0 2>/dev/null || exit 0
+        fi
+        proxyctl_finish
+        return 2 2>/dev/null || exit 2
+        ;;
+    status)
+        shift
+        if ! proxyctl_require_sourced; then
+            proxyctl_finish
+            return 2 2>/dev/null || exit 2
+        fi
+        if [ "$#" -gt 0 ]; then
+            proxyctl_error "$_proxyctl_error_code" "unexpected argument: $1"
+            proxyctl_finish
+            return 2 2>/dev/null || exit 2
+        fi
+        proxyctl_status
+        proxyctl_finish
+        return 0 2>/dev/null || exit 0
+        ;;
+    help|--help|-h)
+        # Help is exempt from the sourcing requirement.
+        proxyctl_help
+        proxyctl_finish
+        return 0 2>/dev/null || exit 0
+        ;;
+    '')
+        # Issue 2: dash's '.' builtin discards its arguments, so a bare
+        # ". ./proxyctl" looks exactly like this. Only this arm can tell the
+        # two apart, which is why the hint is here and nowhere else.
+        if proxyctl_is_sourced; then
+            proxyctl_error "$_proxyctl_error_code" "missing subcommand (if your shell's '.' ignores arguments, run: set -- ARGS; . ./proxyctl)"
+        else
+            proxyctl_error "$_proxyctl_error_code" 'missing subcommand'
+        fi
+        proxyctl_finish
+        return 2 2>/dev/null || exit 2
+        ;;
+    *)
+        proxyctl_error "$_proxyctl_error_code" "unknown subcommand: $proxyctl_command"
+        proxyctl_finish
+        return 2 2>/dev/null || exit 2
+        ;;
+esac
+
+# proxyctl-marker
